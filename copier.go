@@ -33,6 +33,14 @@ const (
 	Float64 float64 = 0
 )
 
+var (
+	DefaultOption = Option{
+		IgnoreEmpty: true,
+		DeepCopy:    true,
+		Converters:  []TypeConverter{TimeToInt64, TimeToPInt64, Int64ToTime, Int64ToPTime, PInt64ToPTime, PInt64ToTime},
+	}
+)
+
 // Option sets copy options
 type Option struct {
 	// setting this value to true will ignore copying zero values of all the fields, including bools, as well as a
@@ -84,7 +92,7 @@ type tagNameMapping struct {
 
 // Copy copy things
 func Copy(toValue interface{}, fromValue interface{}) (err error) {
-	return copier(toValue, fromValue, Option{})
+	return copier(toValue, fromValue, DefaultOption)
 }
 
 // CopyWithOption copy with option
