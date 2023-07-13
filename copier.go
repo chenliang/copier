@@ -45,9 +45,10 @@ var (
 type Option struct {
 	// setting this value to true will ignore copying zero values of all the fields, including bools, as well as a
 	// struct having all it's fields set to their zero values respectively (see IsZero() in reflect/value.go)
-	IgnoreEmpty bool
-	DeepCopy    bool
-	Converters  []TypeConverter
+	IgnoreEmpty   bool
+	CaseSensitive bool
+	DeepCopy      bool
+	Converters    []TypeConverter
 }
 
 func (opt Option) converters() map[converterPair]TypeConverter {
@@ -336,7 +337,7 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 						break
 					}
 
-					toField := dest.FieldByName(destFieldName)
+					toField := fieldByName(dest, destFieldName, opt.CaseSensitive)
 					if toField.IsValid() {
 						if toField.CanSet() {
 							isSet, err := set(toField, fromField, opt.DeepCopy, converters)
@@ -382,7 +383,7 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 				}
 
 				if fromMethod.IsValid() && fromMethod.Type().NumIn() == 0 && fromMethod.Type().NumOut() == 1 && !shouldIgnore(fromMethod, opt.IgnoreEmpty) {
-					if toField := dest.FieldByName(destFieldName); toField.IsValid() && toField.CanSet() {
+					if toField := fieldByName(dest, destFieldName, opt.CaseSensitive); toField.IsValid() && toField.CanSet() {
 						values := fromMethod.Call([]reflect.Value{})
 						if len(values) >= 1 {
 							set(toField, values[0], opt.DeepCopy, converters)
@@ -565,7 +566,7 @@ func set(to, from reflect.Value, deepCopy bool, converters map[converterPair]Typ
 		if from.Kind() == reflect.Ptr && from.IsNil() {
 			return true, nil
 		}
-		if toKind == reflect.Struct || toKind == reflect.Map || toKind == reflect.Slice {
+		if _, ok := to.Addr().Interface().(sql.Scanner); !ok && (toKind == reflect.Struct || toKind == reflect.Map || toKind == reflect.Slice) {
 			return false, nil
 		}
 	}
@@ -776,4 +777,12 @@ func driverValuer(v reflect.Value) (i driver.Valuer, ok bool) {
 
 	i, ok = v.Addr().Interface().(driver.Valuer)
 	return
+}
+
+func fieldByName(v reflect.Value, name string, caseSensitive bool) reflect.Value {
+	if caseSensitive {
+		return v.FieldByName(name)
+	}
+
+	return v.FieldByNameFunc(func(n string) bool { return strings.EqualFold(n, name) })
 }
