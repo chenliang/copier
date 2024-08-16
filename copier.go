@@ -22,6 +22,9 @@ const (
 	// Ignore a destination field from being copied to.
 	tagIgnore
 
+	// Denotes the fact that the field should be overridden, no matter if the IgnoreEmpty is set
+	tagOverride
+
 	// Denotes that the value as been copied
 	hasCopied
 
@@ -211,7 +214,7 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 					to.SetMapIndex(toKey, toValue)
 					break
 				}
-				elemType = reflect.PtrTo(elemType)
+				elemType = reflect.PointerTo(elemType)
 				toValue = toValue.Addr()
 			}
 		}
@@ -219,6 +222,10 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 	}
 
 	if from.Kind() == reflect.Slice && to.Kind() == reflect.Slice {
+		// Return directly if both slices are nil
+		if from.IsNil() && to.IsNil() {
+			return
+		}
 		if to.IsNil() {
 			slice := reflect.MakeSlice(reflect.SliceOf(to.Type().Elem()), from.Len(), from.Cap())
 			to.Set(slice)
@@ -339,7 +346,8 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 				fieldNamesMapping := getFieldNamesMapping(mappings, fromType, toType)
 
 				srcFieldName, destFieldName := getFieldName(name, flgs, fieldNamesMapping)
-				if fromField := fieldByNameOrZeroValue(source, srcFieldName); fromField.IsValid() && !shouldIgnore(fromField, opt.IgnoreEmpty) {
+
+				if fromField := fieldByNameOrZeroValue(source, srcFieldName); fromField.IsValid() && !shouldIgnore(fromField, fieldFlags, opt.IgnoreEmpty) {
 					// process for nested anonymous field
 					destFieldNotSet := false
 					if f, ok := dest.Type().FieldByName(destFieldName); ok {
@@ -414,7 +422,7 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 					fromMethod = source.MethodByName(srcFieldName)
 				}
 
-				if fromMethod.IsValid() && fromMethod.Type().NumIn() == 0 && fromMethod.Type().NumOut() == 1 && !shouldIgnore(fromMethod, opt.IgnoreEmpty) {
+				if fromMethod.IsValid() && fromMethod.Type().NumIn() == 0 && fromMethod.Type().NumOut() == 1 && !shouldIgnore(fromMethod, flgs.BitFlags[name], opt.IgnoreEmpty) {
 					if toField := fieldByName(dest, destFieldName, opt.CaseSensitive); toField.IsValid() && toField.CanSet() {
 						values := fromMethod.Call([]reflect.Value{})
 						if len(values) >= 1 {
@@ -512,8 +520,8 @@ func copyUnexportedStructFields(to, from reflect.Value) {
 	to.Set(tmp)
 }
 
-func shouldIgnore(v reflect.Value, ignoreEmpty bool) bool {
-	return ignoreEmpty && v.IsZero()
+func shouldIgnore(v reflect.Value, bitFlags uint8, ignoreEmpty bool) bool {
+	return ignoreEmpty && bitFlags&tagOverride == 0 && v.IsZero()
 }
 
 var deepFieldsLock sync.RWMutex
@@ -597,6 +605,9 @@ func set(to, from reflect.Value, deepCopy bool, converters map[converterPair]Typ
 			}
 			// allocate new `to` variable with default value (eg. *string -> new(string))
 			to.Set(reflect.New(to.Type().Elem()))
+		} else if from.Kind() != reflect.Ptr && from.IsZero() {
+			to.Set(reflect.Zero(to.Type()))
+			return true, nil
 		}
 		// depointer `to`
 		to = to.Elem()
@@ -611,6 +622,7 @@ func set(to, from reflect.Value, deepCopy bool, converters map[converterPair]Typ
 			}
 		}
 		if from.Kind() == reflect.Ptr && from.IsNil() {
+			to.Set(reflect.Zero(to.Type()))
 			return true, nil
 		}
 		if _, ok := to.Addr().Interface().(sql.Scanner); !ok && (toKind == reflect.Struct || toKind == reflect.Map || toKind == reflect.Slice) {
@@ -618,9 +630,14 @@ func set(to, from reflect.Value, deepCopy bool, converters map[converterPair]Typ
 		}
 	}
 
+	// try convert directly
 	if from.Type().ConvertibleTo(to.Type()) {
 		to.Set(from.Convert(to.Type()))
-	} else if toScanner, ok := to.Addr().Interface().(sql.Scanner); ok {
+		return true, nil
+	}
+
+	// try Scanner
+	if toScanner, ok := to.Addr().Interface().(sql.Scanner); ok {
 		// `from`  -> `to`
 		// *string -> sql.NullString
 		if from.Kind() == reflect.Ptr {
@@ -635,10 +652,13 @@ func set(to, from reflect.Value, deepCopy bool, converters map[converterPair]Typ
 		// string -> sql.NullString
 		// set `to` by invoking method Scan(`from`)
 		err := toScanner.Scan(from.Interface())
-		if err != nil {
-			return false, nil
+		if err == nil {
+			return true, nil
 		}
-	} else if fromValuer, ok := driverValuer(from); ok {
+	}
+
+	// try Valuer
+	if fromValuer, ok := driverValuer(from); ok {
 		// `from`         -> `to`
 		// sql.NullString -> string
 		v, err := fromValuer.Value()
@@ -652,16 +672,21 @@ func set(to, from reflect.Value, deepCopy bool, converters map[converterPair]Typ
 		rv := reflect.ValueOf(v)
 		if rv.Type().AssignableTo(to.Type()) {
 			to.Set(rv)
-		} else if to.CanSet() && rv.Type().ConvertibleTo(to.Type()) {
-			to.Set(rv.Convert(to.Type()))
+			return true, nil
 		}
-	} else if from.Kind() == reflect.Ptr {
-		return set(to, from.Elem(), deepCopy, converters)
-	} else {
+		if to.CanSet() && rv.Type().ConvertibleTo(to.Type()) {
+			to.Set(rv.Convert(to.Type()))
+			return true, nil
+		}
 		return false, nil
 	}
 
-	return true, nil
+	// from is ptr
+	if from.Kind() == reflect.Ptr {
+		return set(to, from.Elem(), deepCopy, converters)
+	}
+
+	return false, nil
 }
 
 // lookupAndCopyWithConverter looks up the type pair, on success the TypeConverter Fn func is called to copy src to dst field.
@@ -701,6 +726,8 @@ func parseTags(tag string) (flg uint8, name string, err error) {
 			flg = flg | tagMust
 		case "nopanic":
 			flg = flg | tagNoPanic
+		case "override":
+			flg = flg | tagOverride
 		default:
 			if unicode.IsUpper([]rune(t)[0]) {
 				name = strings.TrimSpace(t)
@@ -725,6 +752,7 @@ func getFlags(dest, src reflect.Value, toType, fromType reflect.Type) (flags, er
 			TagToFieldName: map[string]string{},
 		},
 	}
+
 	var toTypeFields, fromTypeFields []reflect.StructField
 	if dest.IsValid() {
 		toTypeFields = deepFields(toType)
@@ -754,6 +782,7 @@ func getFlags(dest, src reflect.Value, toType, fromType reflect.Type) (flags, er
 		if tags != "" {
 			var name string
 			var err error
+
 			if _, name, err = parseTags(tags); err != nil {
 				return flags{}, err
 			} else if name != "" {
@@ -762,6 +791,7 @@ func getFlags(dest, src reflect.Value, toType, fromType reflect.Type) (flags, er
 			}
 		}
 	}
+
 	return flgs, nil
 }
 
